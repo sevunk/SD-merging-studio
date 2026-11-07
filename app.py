@@ -258,41 +258,58 @@ def register_studio_api_routes(fastapi_app) -> None:
 def launch_studio_with_gradio_tunnel(port: int = 7860, share: bool = True):
     import gradio as gr
 
-    # Dummy block untuk inisialisasi FRPC tunnel
-    with gr.Blocks(title="MERGING STUDIO v2.0") as demo:
-        gr.Markdown("Loading Studio...")
+    # Fallback iframe layar penuh (jika sewaktu-waktu diakses via komponen Gradio)
+    with gr.Blocks(title="MERGING STUDIO v2.0 — React.js Web Studio") as demo:
+        gr.HTML(
+            '<iframe id="react-studio-frame" src="/studio" allow="clipboard-read; clipboard-write"></iframe>'
+        )
 
     print("✨ Launching Merging Studio via Gradio Tunnel...")
 
+    # 1. Jalankan server dengan prevent_thread_lock=True
     app, local_url, share_url = demo.launch(
         server_name="0.0.0.0",
         server_port=port,
         share=share,
+        css=FULLSCREEN_REACT_CSS,
         prevent_thread_lock=True,
     )
 
+    # 2. HAPUS rute "/" putih bawaan Gradio agar tidak menghalangi React SPA
+    app.router.routes = [
+        r for r in app.router.routes
+        if getattr(r, "path", None) != "/"
+    ]
+
+    # 3. Pasang semua REST API (/api/*) serta rute "/" dan "/studio" milik kita
     register_studio_api_routes(app)
 
-    try:
-        for i, r in enumerate(app.router.routes):
-            if hasattr(r, "path") and r.path in ["/", "/studio"] and getattr(r, "name", "") != "":
-                app.router.routes.insert(0, app.router.routes.pop(i))
-                break
-    except Exception:
-        pass
+    # 4. Pindahkan rute React SPA ("/" dan "/studio") ke urutan paling atas (Index 0)
+    spa_routes = [
+        r for r in app.router.routes
+        if getattr(r, "name", "") == "serve_react_studio"
+    ]
+    other_routes = [
+        r for r in app.router.routes
+        if getattr(r, "name", "") != "serve_react_studio"
+    ]
+    app.router.routes = spa_routes + other_routes
 
     print(f"\n🚀 SUCCESS! Merging Studio running at:")
     print(f"   Local URL:  {local_url}")
     if share_url:
-        print(f"   Public URL: {share_url}\n")
+        print(f"   Public URL: {share_url}")
+        print(f"   Studio URL: {share_url.rstrip('/')}/studio\n")
     print("💡 Tekan tombol STOP di Colab untuk mematikan server.\n")
 
+    # 5. Kunci server agar tetap menyala
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Mematikan server Merging Studio...")
         demo.close()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Launch Merging Studio v2.0 Full React SPA")

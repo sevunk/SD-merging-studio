@@ -70,17 +70,23 @@ footer { display: none !important; }
 
 
 def register_studio_api_routes(fastapi_app) -> None:
-    """Registers the full REST API on Gradio's FastAPI app so the React.js frontend
-    communicates directly with the Python engines on the same `*.gradio.live` origin.
+    """Registers the React SPA at root ('/') and all REST APIs directly onto
+    the live server running behind the Gradio tunnel.
     """
 
+    # 1. Sajikan React SPA langsung di Root "/" DAN "/studio"
+    @fastapi_app.get("/", response_class=HTMLResponse)
     @fastapi_app.get("/studio", response_class=HTMLResponse)
     async def serve_react_studio():
         if os.path.exists(FRONTEND_HTML_PATH):
             with open(FRONTEND_HTML_PATH, "r", encoding="utf-8") as f:
                 return HTMLResponse(content=f.read())
-        return HTMLResponse(content="<h1>Error: frontend/index.html not found</h1>", status_code=404)
+        return HTMLResponse(
+            content=f"<h1>Error: {FRONTEND_HTML_PATH} not found</h1>", 
+            status_code=404
+        )
 
+    # 2. REST API Endpoints
     @fastapi_app.get("/api/status")
     async def api_status():
         try:
@@ -251,21 +257,31 @@ def register_studio_api_routes(fastapi_app) -> None:
 def launch_studio_with_gradio_tunnel(port: int = 7860, share: bool = True):
     import gradio as gr
 
-    with gr.Blocks(title="MERGING STUDIO v2.0 — React.js Web Studio") as demo:
-        gr.HTML(
-            '<iframe id="react-studio-frame" src="/studio" allow="clipboard-read; clipboard-write"></iframe>'
-        )
+    # Dummy block untuk memicu infrastruktur FRPC Gradio Tunnel
+    with gr.Blocks(title="MERGING STUDIO v2.0") as demo:
+        gr.Markdown("Loading Studio...")
 
-    # Attach our REST API and /studio React SPA route directly to Gradio's internal FastAPI app
-    register_studio_api_routes(demo.app)
+    print("✨ Launching Merging Studio via Gradio Tunnel...")
 
-    print("✨ Launching Full React.js + HTML5 + CSS3 Dark Studio via Gradio Tunnel...")
-    demo.launch(
+    # KUNCI PERBAIKAN:
+    # 1. Gunakan prevent_thread_lock=True agar launch() mengembalikan server yang aktif
+    app, local_url, share_url = demo.launch(
         server_name="0.0.0.0",
         server_port=port,
         share=share,
-        css=FULLSCREEN_REACT_CSS,
+        prevent_thread_lock=True,
     )
+
+    # 2. Pasang semua rute LANGSUNG ke instance server yang sedang berjalan
+    register_studio_api_routes(app)
+
+    print(f"\n🚀 SUCCESS! Merging Studio running at:")
+    print(f"   Local URL:  {local_url}")
+    if share_url:
+        print(f"   Public URL: {share_url}\n")
+
+    # 3. Kunci thread agar server tetap hidup
+    demo.block_till_done()
 
 
 if __name__ == "__main__":

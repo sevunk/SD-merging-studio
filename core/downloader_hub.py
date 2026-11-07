@@ -15,9 +15,15 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 import zipfile
-from typing import Any, Callable, Dict, List, Optional
+
+# Matikan progress bar interaktif tqdm & HuggingFace Hub secara global
+# agar tidak mencetak ribuan baris "Processing Files" yang membuat Colab hang
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TQDM_DISABLE"] = "1"
 
 
 def get_filename_from_url(url: str) -> Optional[str]:
@@ -41,36 +47,37 @@ def resolve_url_and_filename(url: str, headers: Optional[Dict[str, str]] = None)
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
     try:
-        response = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=15)
-        final_url = response.url
-        filename = None
+        # Gunakan context manager 'with' agar koneksi stream langsung ditutup setelah membaca header
+        with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=15) as response:
+            final_url = response.url
+            filename = None
 
-        cd = response.headers.get("content-disposition")
-        if cd:
-            filenames = re.findall(r'filename=["\']?([^"\']+)["\']?', cd)
-            if filenames:
-                filename = filenames[0]
-            else:
-                filenames = re.findall(r"filename\*=UTF-8''(.+)", cd)
+            cd = response.headers.get("content-disposition")
+            if cd:
+                filenames = re.findall(r'filename=["\']?([^"\']+)["\']?', cd)
                 if filenames:
-                    filename = unquote(filenames[0])
-
-        if not filename:
-            parsed_url = urlparse(final_url)
-            query_params = parse_qs(parsed_url.query)
-            for key in ["b2ContentDisposition", "response-content-disposition", "content-disposition"]:
-                if key in query_params:
-                    val = query_params[key][0]
-                    filenames = re.findall(r'filename=["\']?([^"\']+)["\']?', val)
+                    filename = filenames[0]
+                else:
+                    filenames = re.findall(r"filename\*=UTF-8''(.+)", cd)
                     if filenames:
-                        filename = filenames[0]
-                        break
+                        filename = unquote(filenames[0])
 
-        if not filename:
-            parsed_url = urlparse(final_url)
-            filename = os.path.basename(unquote(parsed_url.path))
+            if not filename:
+                parsed_url = urlparse(final_url)
+                query_params = parse_qs(parsed_url.query)
+                for key in ["b2ContentDisposition", "response-content-disposition", "content-disposition"]:
+                    if key in query_params:
+                        val = query_params[key][0]
+                        filenames = re.findall(r'filename=["\']?([^"\']+)["\']?', val)
+                        if filenames:
+                            filename = filenames[0]
+                            break
 
-        return final_url, filename
+            if not filename:
+                parsed_url = urlparse(final_url)
+                filename = os.path.basename(unquote(parsed_url.path))
+
+            return final_url, filename
     except Exception:
         return url, None
 
@@ -82,8 +89,9 @@ def download_single_url(
     civ_token: str = "",
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """Executes the exact 3-tier download engine from Cell 2 (Aria2c -> Curl -> Python Stream)."""
+    """Executes the exact 3-tier download engine from Cell 2 (Aria2c -> Curl -> Python Stream) with clean logs."""
     def log(msg: str):
+        print(msg, flush=True)
         if log_fn:
             log_fn(msg)
 
@@ -92,39 +100,49 @@ def download_single_url(
         return {"status": "skipped", "reason": "empty_url"}
 
     os.makedirs(destination, exist_ok=True)
+    clean_hf_token = hf_token.strip() if hf_token and hf_token.strip() else None
 
     if "civitai.red" in url:
         url = url.replace("civitai.red", "civitai.com")
         log("🔄 Detected 'civitai.red', automatically replaced with 'civitai.com'")
 
-    # 1. Handle GitHub
+    # 1. Handle GitHub (Quiet mode agar tidak spam log)
     if "github.com" in url:
         repo_name = url.rstrip("/").split("/")[-1].replace(".git", "")
         target = os.path.join(destination, repo_name)
         if not os.path.exists(target):
-            log(f"🐙 Cloning GitHub repo {repo_name}...")
-            subprocess.run(["git", "clone", "--depth", "1", url, target])
+            log(f"🐙 Cloning GitHub repo: {repo_name}...")
+            subprocess.run(["git", "clone", "-q", "--depth", "1", url, target], check=False)
+            log(f"✅ Finished cloning {repo_name}")
         return {"status": "cloned", "target": target}
 
-    # 2. Handle HF Repo (CLI)
+    # 2. Handle HF Repo menggunakan API resmi snapshot_download (Tanpa spam progress bar)
     if "huggingface.co" in url and all(x not in url for x in ["/resolve/", "/blob/"]):
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.utils import disable_progress_bars
+
+        disable_progress_bars()
         repo_id = "/".join(url.split("huggingface.co/")[1].split("/")[:2])
-        log(f"🤗 Downloading HF Repo: {repo_id}...")
-        cmd = ["huggingface-cli", "download", repo_id, "--local-dir", destination, "--local-dir-use-symlinks", "False"]
-        if hf_token:
-            cmd.extend(["--token", hf_token])
-        subprocess.run(cmd)
-        return {"status": "downloaded_repo", "repo_id": repo_id}
+        t0 = time.time()
+        log(f"🤗 Downloading HF Repo: {repo_id} (mohon tunggu, log progress bar diringkas)...")
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=destination,
+            token=clean_hf_token,
+        )
+        elapsed = round(time.time() - t0, 1)
+        log(f"✅ HF Repo '{repo_id}' downloaded in {elapsed}s!")
+        return {"status": "downloaded_repo", "repo_id": repo_id, "elapsed_sec": elapsed}
 
     # 3. Direct File Download (Civitai / HF File)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
     if "civitai.com" in url and civ_token and "token=" not in url:
-        url = url + ("&" if "?" in url else "?") + f"token={civ_token}"
+        url = url + ("&" if "?" in url else "?") + f"token={civ_token.strip()}"
         log("🔑 Civitai Token applied to URL.")
-    elif "huggingface.co" in url and hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
+    elif "huggingface.co" in url and clean_hf_token:
+        headers["Authorization"] = f"Bearer {clean_hf_token}"
 
     log(f"🔍 Resolving redirect link for: {url[:80]}...")
     final_url, filename = resolve_url_and_filename(url, headers)
@@ -137,12 +155,19 @@ def download_single_url(
             log(f"⚠️ Existing file '{filename}' is <1MB. Deleting and re-downloading...")
             os.remove(output_path)
         else:
-            log(f"✅ File '{filename}' already exists ({os.path.getsize(output_path)/(1024**3):.2f} GiB). Skipping.")
+            sz_gb = os.path.getsize(output_path) / (1024 ** 3)
+            log(f"✅ File '{filename}' already exists ({sz_gb:.2f} GiB). Skipping.")
             return {"status": "exists", "file_path": output_path, "filename": filename}
 
-    log(f"🚀 Trying Aria2c Turbo Mode -> {filename}...")
+    t0 = time.time()
+    log(f"🚀 Downloading '{filename}' via Aria2c Turbo (silent mode)...")
     aria_cmd = [
-        "aria2c", "--console-log-level=warn", "-x", "8", "-s", "8", "-k", "1M",
+        "aria2c",
+        "--console-log-level=error",
+        "--summary-interval=0",
+        "--download-result=hide",
+        "--quiet=true",
+        "-x", "8", "-s", "8", "-k", "1M",
         f"--user-agent={headers['User-Agent']}",
         "-d", destination,
         "-o", filename,
@@ -155,7 +180,9 @@ def download_single_url(
 
     result = subprocess.run(aria_cmd)
     if result.returncode == 0 and os.path.exists(output_path):
-        log(f"✅ Downloaded {filename} via Aria2c Turbo!")
+        sz_gb = os.path.getsize(output_path) / (1024 ** 3)
+        elapsed = round(time.time() - t0, 1)
+        log(f"✅ Downloaded '{filename}' ({sz_gb:.2f} GiB) in {elapsed}s via Aria2c Turbo!")
         return {"status": "downloaded", "method": "aria2c", "file_path": output_path, "filename": filename}
 
     log("⚠️ Aria2c failed. Trying fallback (Curl)...")
@@ -165,7 +192,7 @@ def download_single_url(
     if os.path.exists(output_path):
         os.remove(output_path)
 
-    curl_cmd = ["curl", "-f", "-g", "-L", "--user-agent", headers["User-Agent"], "-o", output_path]
+    curl_cmd = ["curl", "-f", "-s", "-S", "-g", "-L", "--user-agent", headers["User-Agent"], "-o", output_path]
     if "civitai.com" not in url:
         curl_cmd.extend(["-C", "-"])
     for k, v in headers.items():
@@ -173,16 +200,22 @@ def download_single_url(
     curl_cmd.append(final_url)
     res_curl = subprocess.run(curl_cmd)
     if res_curl.returncode == 0 and os.path.exists(output_path):
-        log(f"✅ Downloaded {filename} via Curl!")
+        sz_gb = os.path.getsize(output_path) / (1024 ** 3)
+        elapsed = round(time.time() - t0, 1)
+        log(f"✅ Downloaded '{filename}' ({sz_gb:.2f} GiB) in {elapsed}s via Curl!")
         return {"status": "downloaded", "method": "curl", "file_path": output_path, "filename": filename}
 
     log("⚠️ Curl failed. Trying ultimate fallback (Python Stream)...")
     import requests
-    response = requests.get(final_url, headers=headers, stream=True)
-    with open(output_path, "wb") as f:
-        for data in response.iter_content(1024 * 1024):
-            f.write(data)
-    log(f"✅ Downloaded {filename} via Python Stream!")
+    with requests.get(final_url, headers=headers, stream=True) as response:
+        response.raise_for_status()
+        with open(output_path, "wb") as f:
+            for data in response.iter_content(16 * 1024 * 1024):
+                if data:
+                    f.write(data)
+    sz_gb = os.path.getsize(output_path) / (1024 ** 3)
+    elapsed = round(time.time() - t0, 1)
+    log(f"✅ Downloaded '{filename}' ({sz_gb:.2f} GiB) in {elapsed}s via Python Stream!")
     return {"status": "downloaded", "method": "python_stream", "file_path": output_path, "filename": filename}
 
 
@@ -203,15 +236,17 @@ def download_batch_and_modelscope(
 
     if modelscope_repo and modelscope_repo.strip():
         repo_id = modelscope_repo.strip()
+        msg = f"⏳ Cloning ModelScope repository: {repo_id}..."
+        print(msg, flush=True)
         if log_fn:
-            log_fn(f"⏳ Cloning ModelScope repository: {repo_id}...")
+            log_fn(msg)
         subprocess.run("git lfs install > /dev/null 2>&1", shell=True)
         git_url = (
             f"https://oauth2:{modelscope_token.strip()}@www.modelscope.ai/{repo_id}.git"
             if modelscope_token and modelscope_token.strip()
             else f"https://www.modelscope.ai/{repo_id}.git"
         )
-        subprocess.run(["git", "clone", git_url], cwd=destination)
+        subprocess.run(["git", "clone", "-q", git_url], cwd=destination)
         results.append({"status": "modelscope_cloned", "repo": repo_id})
 
     return {"results": results, "destination": destination}
@@ -227,26 +262,32 @@ def publish_to_huggingface_hub(
     make_private: bool = False,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """Logs into HuggingFace Hub, creates the repo if needed, and uploads multiple files/folders (Cells 11B & 12)."""
-    from huggingface_hub import HfApi, login
-    from huggingface_hub.utils import validate_repo_id
+    """Authenticates with HfApi(token=...), creates the repo if needed, and uploads files/folders cleanly."""
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils import disable_progress_bars, validate_repo_id
 
-    if not hf_token or not hf_token.startswith("hf_"):
+    # Pastikan progress bar "Processing Files" dimatikan agar tidak membuat Colab hang
+    disable_progress_bars()
+
+    def log(msg: str):
+        print(msg, flush=True)
+        if log_fn:
+            log_fn(msg)
+
+    clean_token = hf_token.strip() if hf_token else ""
+    if not clean_token or not clean_token.startswith("hf_"):
         raise ValueError("Invalid Hugging Face token (must start with 'hf_').")
 
-    if log_fn:
-        log_fn("🔑 Logging into Hugging Face Hub...")
-    login(token=hf_token, add_to_git_credential=True)
-    api = HfApi()
+    log("🔑 Authenticating with Hugging Face Hub...")
+    api = HfApi(token=clean_token)
     user = api.whoami()
     username = user["name"]
     repo_owner = organization_name.strip() if organization_name and organization_name.strip() else username
-    repo_id = f"{repo_owner}/{model_repo_name.strip()}"
+    repo_id = f"{repo_owner}/{model_repo_name.strip().strip('/')}"
 
     validate_repo_id(repo_id)
     api.create_repo(repo_id=repo_id, repo_type="model", private=make_private, exist_ok=True)
-    if log_fn:
-        log_fn(f"✅ Model repository ready: https://huggingface.co/{repo_id}")
+    log(f"✅ Model repository ready: https://huggingface.co/{repo_id}")
 
     paths_list = [p.strip() for p in paths_csv.split(",") if p.strip()]
     uploaded_urls = []
@@ -254,41 +295,57 @@ def publish_to_huggingface_hub(
     for item_path in paths_list:
         local_path = Path(item_path)
         if not local_path.exists():
-            if log_fn:
-                log_fn(f"⚠️ Skipping missing path: {item_path}")
+            log(f"⚠️ Skipping missing path: {item_path}")
             continue
 
         is_folder = local_path.is_dir()
-        target_repo_path = path_in_repo.strip()
-        if not target_repo_path:
-            target_repo_path = local_path.name
-        elif len(paths_list) > 1 or (not is_folder and target_repo_path.endswith("/")):
-            target_repo_path = f"{target_repo_path.rstrip('/')}/{local_path.name}"
+        target_repo_path = path_in_repo.strip().strip("/")
 
-        if log_fn:
-            log_fn(f"🚀 Uploading '{local_path.name}' -> {repo_id}/{target_repo_path}...")
+        if is_folder:
+            # Jika meng-upload 1 folder dan path_in_repo kosong, upload ke root repo ("")
+            if not target_repo_path and len(paths_list) > 1:
+                target_repo_path = local_path.name
+        else:
+            if not target_repo_path:
+                target_repo_path = local_path.name
+            elif len(paths_list) > 1 or path_in_repo.strip().endswith("/"):
+                target_repo_path = f"{target_repo_path}/{local_path.name}"
+
+        t0 = time.time()
+        sz_info = (
+            f" ({local_path.stat().st_size / (1024**3):.2f} GiB)"
+            if not is_folder
+            else " (folder)"
+        )
+        log(f"🚀 Uploading '{local_path.name}'{sz_info} -> {repo_id}/{target_repo_path or '(root)'}...")
 
         if is_folder:
             api.upload_folder(
                 folder_path=str(local_path),
-                path_in_repo=target_repo_path,
+                path_in_repo=target_repo_path or None,
                 repo_id=repo_id,
+                repo_type="model",
                 commit_message=commit_message,
                 ignore_patterns=[".ipynb_checkpoints", "__pycache__", "*.tmp"],
             )
-            url = f"https://huggingface.co/{repo_id}/tree/main/{target_repo_path}"
+            url = (
+                f"https://huggingface.co/{repo_id}/tree/main/{target_repo_path}"
+                if target_repo_path
+                else f"https://huggingface.co/{repo_id}/tree/main"
+            )
         else:
             api.upload_file(
                 path_or_fileobj=str(local_path),
                 path_in_repo=target_repo_path,
                 repo_id=repo_id,
+                repo_type="model",
                 commit_message=commit_message,
             )
             url = f"https://huggingface.co/{repo_id}/blob/main/{target_repo_path}"
 
+        elapsed = round(time.time() - t0, 1)
         uploaded_urls.append(url)
-        if log_fn:
-            log_fn(f"✅ Uploaded: {url}")
+        log(f"✅ Uploaded '{local_path.name}' in {elapsed}s -> {url}")
 
     return {"repo_id": repo_id, "uploaded_urls": uploaded_urls}
 

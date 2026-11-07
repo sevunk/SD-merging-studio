@@ -1,181 +1,277 @@
-"""Merging Studio v2.0 — FastAPI + Gradio Public Tunnel Bridge Server (`app.py`).
+"""Merging Studio v2.0 — Full React.js + HTML5/CSS3 Web Studio Server with Gradio Tunnel (`app.py`).
 
-When launched in Google Colab via `python3 app.py --share`, this script:
-1. Starts the Gradio Public Tunnel (`https://xxxx.gradio.live`)
-2. Mounts the full HTML5 + CSS3 + React.js Web Studio UI and REST API endpoints
-   connecting every button in the UI directly to `core/` and `architectures/`.
+FIX FOR GRADIO DEFAULT UI:
+Instead of showing plain white Gradio input boxes, this server:
+1. Mounts all REST API endpoints (`/api/status`, `/api/download`, `/api/file-commander`,
+   `/api/inspect`, `/api/merge-checkpoint`, `/api/lora-studio`, `/api/quantize`,
+   `/api/xray`, `/api/hf-upload`, `/api/flush`) directly onto Gradio's underlying
+   FastAPI instance (`demo.app`).
+2. Serves the custom Dark Glassmorphism **HTML5 + CSS3 + React.js 18 Single-Page Application**
+   (`frontend/index.html`) at `/studio` and embeds it full-screen (`100vw x 100vh`, zero Gradio
+   chrome/padding) inside the `*.gradio.live` root page!
 """
 
 from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Any, Dict, List
+
+from fastapi import Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
-from architectures import ARCH_REGISTRY
 from core.analyzer_xray import export_xray_report, inspect_safetensors_quick
-from core.downloader_hub import execute_file_commander, flush_colab_system
-from core.lora_svd_engine import merge_multi_loras_svd
+from core.downloader_hub import (
+    download_batch_and_modelscope,
+    execute_file_commander,
+    flush_colab_system,
+    get_system_resources,
+    publish_to_huggingface_hub,
+)
+from core.gguf_cuda_kernels import run_krea2_to_gguf_converter
+from core.lora_svd_engine import (
+    bake_loras_to_checkpoint,
+    extract_lora_svd_turbo,
+    merge_multi_loras_svd,
+)
 from core.merge_algorithms import run_unified_checkpoint_merge
+from core.quantizer_engine import (
+    run_universal_int8_convrot_quantizer,
+    run_universal_unquantizer_v5,
+)
 
 
-def create_gradio_studio_interface():
-    """Builds the Gradio Blocks bridge that embeds the React/HTML5/CSS3 Studio
-    and exposes Python backend handlers for Google Colab (`share=True`).
+FRONTEND_HTML_PATH = os.path.join(REPO_DIR, "frontend", "index.html")
+
+# CSS to strip away all default white Gradio padding/borders/footers so the React.js SPA fills 100% of the screen
+FULLSCREEN_REACT_CSS = """
+body, .gradio-container {
+    margin: 0 !important;
+    padding: 0 !important;
+    max-width: 100vw !important;
+    width: 100vw !important;
+    min-height: 100vh !important;
+    background: #020617 !important;
+    overflow-x: hidden !important;
+}
+footer { display: none !important; }
+#react-studio-frame {
+    width: 100vw;
+    height: 100vh;
+    border: none;
+    display: block;
+    background: #020617;
+}
+"""
+
+
+def register_studio_api_routes(fastapi_app) -> None:
+    """Registers the full REST API on Gradio's FastAPI app so the React.js frontend
+    communicates directly with the Python engines on the same `*.gradio.live` origin.
     """
+
+    @fastapi_app.get("/studio", response_class=HTMLResponse)
+    async def serve_react_studio():
+        if os.path.exists(FRONTEND_HTML_PATH):
+            with open(FRONTEND_HTML_PATH, "r", encoding="utf-8") as f:
+                return HTMLResponse(content=f.read())
+        return HTMLResponse(content="<h1>Error: frontend/index.html not found</h1>", status_code=404)
+
+    @fastapi_app.get("/api/status")
+    async def api_status():
+        try:
+            return JSONResponse(get_system_resources("/content"))
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @fastapi_app.post("/api/flush")
+    async def api_flush():
+        try:
+            return JSONResponse(flush_colab_system())
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @fastapi_app.post("/api/inspect")
+    async def api_inspect(req: Request):
+        try:
+            body = await req.json()
+            res = inspect_safetensors_quick(body.get("file_path", ""))
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @fastapi_app.post("/api/download")
+    async def api_download(req: Request):
+        try:
+            body = await req.json()
+            res = download_batch_and_modelscope(
+                urls_csv=body.get("urls_csv", ""),
+                destination=body.get("destination", "/content"),
+                hf_token=body.get("hf_token", ""),
+                civ_token=body.get("civ_token", ""),
+                modelscope_repo=body.get("modelscope_repo", ""),
+                modelscope_token=body.get("modelscope_token", ""),
+            )
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @fastapi_app.post("/api/file-commander")
+    async def api_file_commander(req: Request):
+        try:
+            body = await req.json()
+            res = execute_file_commander(
+                operation=body.get("operation", "Copy"),
+                source_path=body.get("source_path", ""),
+                destination_path=body.get("destination_path", ""),
+            )
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @fastapi_app.post("/api/merge-checkpoint")
+    async def api_merge_checkpoint(req: Request):
+        try:
+            body = await req.json()
+            res = run_unified_checkpoint_merge(
+                base_model_path=body.get("base_model_path", ""),
+                donor_model_paths=body.get("donor_model_paths", []),
+                output_path=body.get("output_path", "/content/merged_output.safetensors"),
+                arch_id=body.get("arch_id", "Auto-Detect"),
+                merge_mode=body.get("merge_mode", "Auto"),
+                output_format=body.get("output_format", "bf16"),
+                donor_weights_str=body.get("donor_weights_str", ""),
+                ties_density=float(body.get("ties_density", 0.40)),
+                p_drop=float(body.get("p_drop", 0.0)),
+                seed=int(body.get("seed", 42)),
+                early_strength=float(body.get("early_strength", 0.55)),
+                mid_strength=float(body.get("mid_strength", 0.90)),
+                late_strength=float(body.get("late_strength", 0.30)),
+                other_strength=float(body.get("other_strength", 0.50)),
+            )
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @fastapi_app.post("/api/lora-studio")
+    async def api_lora_studio(req: Request):
+        try:
+            body = await req.json()
+            mode = body.get("mode", "svd_merge")
+            if mode == "svd_merge":
+                res = merge_multi_loras_svd(
+                    loras_cfg=body.get("loras_cfg", []),
+                    output_lora_path=body.get("output_path", "/content/merged_lora.safetensors"),
+                    arch_id=body.get("arch_id", "MOSS_Image"),
+                    target_rank=int(body.get("target_rank", 128)),
+                    target_alpha=int(body.get("target_alpha", 128)),
+                    qkv_output_mode=body.get("qkv_output_mode", "fused_qkv"),
+                )
+            elif mode == "baker":
+                res = bake_loras_to_checkpoint(
+                    base_model_path=body.get("base_model_path", ""),
+                    loras_cfg=body.get("loras_cfg", []),
+                    output_path=body.get("output_path", "/content/baked_model.safetensors"),
+                    krea2_mix_precision_bf16=bool(body.get("krea2_mix_precision_bf16", True)),
+                )
+            else:
+                res = extract_lora_svd_turbo(
+                    base_path=body.get("base_model_path", ""),
+                    tuned_path=body.get("tuned_model_path", ""),
+                    out_path=body.get("output_path", "/content/extracted_lora.safetensors"),
+                    rank_val=int(body.get("target_rank", 256)),
+                    alpha_val=int(body.get("target_alpha", 256)),
+                )
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @fastapi_app.post("/api/quantize")
+    async def api_quantize(req: Request):
+        try:
+            body = await req.json()
+            mode = body.get("mode", "int8_convrot")
+            if mode == "int8_convrot":
+                res = run_universal_int8_convrot_quantizer(
+                    input_model_path=body.get("input_path", ""),
+                    output_model_path=body.get("output_path", ""),
+                    prefix_mode=body.get("prefix_mode", "Auto"),
+                    inject_moss_attention_config=bool(body.get("inject_moss_attention_config", True)),
+                    restore_moss_rope_bands=bool(body.get("restore_moss_rope_bands", True)),
+                )
+            elif mode == "unquantize":
+                res = run_universal_unquantizer_v5(
+                    input_model_path=body.get("input_path", ""),
+                    output_model_path=body.get("output_path", ""),
+                    prefix_mode=body.get("prefix_mode", "Auto"),
+                    restore_moss_rope_bands=bool(body.get("restore_moss_rope_bands", True)),
+                )
+            else:
+                res = run_krea2_to_gguf_converter(
+                    input_safetensors_path=body.get("input_path", ""),
+                    output_gguf_path=body.get("output_path", ""),
+                    quant_profile=body.get("gguf_profile", "True_Q4_K_M_HighQuality_8.28GiB"),
+                )
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @fastapi_app.post("/api/xray")
+    async def api_xray(req: Request):
+        try:
+            body = await req.json()
+            res = export_xray_report(
+                input_p=body.get("input_path", ""),
+                out_p=body.get("output_path", ""),
+                fmt=body.get("format", "json"),
+            )
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @fastapi_app.post("/api/hf-upload")
+    async def api_hf_upload(req: Request):
+        try:
+            body = await req.json()
+            res = publish_to_huggingface_hub(
+                hf_token=body.get("hf_token", ""),
+                model_repo_name=body.get("model_repo_name", ""),
+                paths_csv=body.get("paths_csv", ""),
+                commit_message=body.get("commit_message", "feat: Upload model from Merging Studio v2.0"),
+            )
+            return JSONResponse(res)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+
+def launch_studio_with_gradio_tunnel(port: int = 7860, share: bool = True):
     import gradio as gr
 
-    with gr.Blocks(
-        title="Merging Studio v2.0 — MOSS Image, Krea 2, Anima, MiniMax H3",
-        theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"),
-    ) as demo:
+    with gr.Blocks(title="MERGING STUDIO v2.0 — React.js Web Studio") as demo:
         gr.HTML(
-            """
-            <div style="background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); padding: 18px 24px; border-radius: 16px; border: 1px solid #312e81; color: #f8fafc; margin-bottom: 12px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
-                <div>
-                  <h1 style="margin:0; font-size:20px; font-weight:800; color:#fff;">🚀 MERGING STUDIO v2.0 (GitHub + Gradio Tunnel Edition)</h1>
-                  <p style="margin:4px 0 0 0; font-size:13px; color:#94a3b8;">
-                    100% Locked Layer Blueprints • MOSS Image (42L) • Krea 2 (28B + TextFusion + Direct INT8 ConvRot + GGUF) • Anima • MiniMax H3
-                  </p>
-                </div>
-                <div style="background:#065f46; color:#6ee7b7; padding:6px 12px; border-radius:999px; font-size:12px; font-weight:700;">
-                  🛡️ Golden Layer Invariants: LOCKED
-                </div>
-              </div>
-            </div>
-            """
+            '<iframe id="react-studio-frame" src="/studio" allow="clipboard-read; clipboard-write"></iframe>'
         )
 
-        with gr.Tabs():
-            # TAB 1: DOWNLOAD & FILE COMMANDER
-            with gr.Tab("1. 📥 Download & File Commander"):
-                with gr.Row():
-                    with gr.Column():
-                        dl_urls = gr.Textbox(label="Model URLs (Comma-Separated: HF / Civitai / ModelScope / GitHub)", lines=2)
-                        with gr.Row():
-                            civ_tok = gr.Textbox(label="Civitai API Token", type="password")
-                            hf_tok = gr.Textbox(label="HuggingFace Token", type="password")
-                        dl_dest = gr.Textbox(label="Destination Folder", value="/content")
-                    with gr.Column():
-                        fc_op = gr.Dropdown(
-                            choices=["Copy", "Move", "Delete", "Zip (Compress)", "Extract (Unzip/Unrar)"],
-                            value="Copy",
-                            label="File Commander Operation",
-                        )
-                        fc_src = gr.Textbox(label="Source Path", value="/content")
-                        fc_dst = gr.Textbox(label="Destination Path", value="/content/drive/MyDrive")
-                        fc_btn = gr.Button("📂 Execute File Operation", variant="primary")
-                        flush_btn = gr.Button("🧹 1-Click Flush RAM, CUDA Cache & /tmp", variant="stop")
-                        fc_out = gr.JSON(label="System / File Status")
+    # Attach our REST API and /studio React SPA route directly to Gradio's internal FastAPI app
+    register_studio_api_routes(demo.app)
 
-                fc_btn.click(
-                    fn=lambda op, s, d: execute_file_commander(op, s, d),
-                    inputs=[fc_op, fc_src, fc_dst],
-                    outputs=fc_out,
-                )
-                flush_btn.click(fn=flush_colab_system, inputs=[], outputs=fc_out)
-
-            # TAB 2: CHECKPOINT MERGER
-            with gr.Tab("2. 🔥 Checkpoint Merger (MOSS, Krea 2, Anima, MiniMax H3)"):
-                with gr.Row():
-                    base_in = gr.Textbox(label="Base Model Path (.safetensors — BF16 or INT8 ConvRot)", value="/content/mossImage_sft_bf16.safetensors")
-                    inspect_btn = gr.Button("🔍 Auto-Inspect Base Model")
-                inspect_out = gr.JSON(label="Smart File Inspector Readout")
-                inspect_btn.click(fn=inspect_safetensors_quick, inputs=[base_in], outputs=[inspect_out])
-
-                donors_in = gr.Textbox(
-                    label="Donor Model Paths (Comma-Separated — Freely Mix BF16 & INT8 ConvRot!)",
-                    lines=2,
-                )
-                weights_in = gr.Textbox(label="Donor Weights (Comma-Separated, e.g. 0.45, 0.35, 0.20)", value="0.45, 0.35, 0.20")
-
-                with gr.Row():
-                    arch_sel = gr.Dropdown(
-                        choices=["Auto-Detect", "MOSS_Image", "KREA_2", "ANIMA", "MINIMAX_H3"],
-                        value="Auto-Detect",
-                        label="Model Architecture",
-                    )
-                    mode_sel = gr.Dropdown(
-                        choices=[
-                            "Auto",
-                            "Block_Guided_V3",
-                            "True_Disjoint_TIES",
-                            "Norm_Preserving_TIES",
-                            "Pure_Weighted_Linear",
-                            "DARE_Hydra_Krea2",
-                            "Krea2_Zone_Guided_DARE",
-                            "DARE_Hydra_Anima",
-                            "DARE_Hydra_Minimax",
-                        ],
-                        value="Auto",
-                        label="Merge Mode",
-                    )
-                    fmt_sel = gr.Dropdown(
-                        choices=["bf16", "int8_convrot", "mix_bf16_f32", "fp16", "native"],
-                        value="bf16",
-                        label="Output Format",
-                    )
-
-                with gr.Accordion("🎛️ Block-Guided / Zone Strength & Pro DARE/TIES Settings", open=False):
-                    with gr.Row():
-                        early_s = gr.Slider(0.0, 1.2, value=0.55, step=0.05, label="Early / Low Zone Strength")
-                        mid_s = gr.Slider(0.0, 1.2, value=0.90, step=0.05, label="Mid Zone Strength")
-                        late_s = gr.Slider(0.0, 1.2, value=0.30, step=0.05, label="Late / High Zone Strength")
-                        other_s = gr.Slider(0.0, 1.2, value=0.50, step=0.05, label="Other / TextFusion Strength")
-                    with gr.Row():
-                        ties_d = gr.Slider(0.1, 0.5, value=0.40, step=0.05, label="TIES Density")
-                        p_drp = gr.Slider(0.0, 0.7, value=0.00, step=0.05, label="DARE p_drop")
-                        seed_in = gr.Number(value=42, label="Random Seed", precision=0)
-
-                out_merge_p = gr.Textbox(label="Output Merged Checkpoint Path", value="/content/merged_output.safetensors")
-                merge_btn = gr.Button("🚀 Execute Streaming Checkpoint Merge", variant="primary")
-                merge_res = gr.JSON(label="Merge Result")
-
-                merge_btn.click(
-                    fn=lambda b, d_str, o, a, m, f, w, td, pd, sd, es, ms, ls, os_val: run_unified_checkpoint_merge(
-                        base_model_path=b,
-                        donor_model_paths=[x.strip() for x in d_str.split(",") if x.strip()],
-                        output_path=o,
-                        arch_id=a,
-                        merge_mode=m,
-                        output_format=f,
-                        donor_weights_str=w,
-                        ties_density=td,
-                        p_drop=pd,
-                        seed=int(sd),
-                        early_strength=es,
-                        mid_strength=ms,
-                        late_strength=ls,
-                        other_strength=os_val,
-                    ),
-                    inputs=[
-                        base_in, donors_in, out_merge_p, arch_sel, mode_sel, fmt_sel,
-                        weights_in, ties_d, p_drp, seed_in, early_s, mid_s, late_s, other_s,
-                    ],
-                    outputs=[merge_res],
-                )
-
-            # TAB 5: THE X-RAY EXPORTER
-            with gr.Tab("5. 🔬 The X-Ray & Pre-Merge Analyzer"):
-                xray_in = gr.Textbox(label="Input .safetensors File Path", value="/content/MOSS_Realistic_LoRA.safetensors")
-                xray_out = gr.Textbox(label="Output Report Path (.json / .txt)", value="/content/MOSS_Realistic_LoRA.json")
-                xray_fmt = gr.Dropdown(choices=["json", "txt"], value="json", label="Report Format")
-                xray_btn = gr.Button("🕵️ Export X-Ray Report", variant="primary")
-                xray_res = gr.JSON(label="X-Ray Result")
-                xray_btn.click(fn=export_xray_report, inputs=[xray_in, xray_out, xray_fmt], outputs=[xray_res])
-
-    return demo
+    print("✨ Launching Full React.js + HTML5 + CSS3 Dark Studio via Gradio Tunnel...")
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=share,
+        css=FULLSCREEN_REACT_CSS,
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Launch Merging Studio v2.0")
+    parser = argparse.ArgumentParser(description="Launch Merging Studio v2.0 Full React SPA")
     parser.add_argument("--share", action="store_true", default=True, help="Create public Gradio share link")
     parser.add_argument("--port", type=int, default=7860, help="Server port")
     args = parser.parse_args()
 
-    ui = create_gradio_studio_interface()
-    ui.launch(server_name="0.0.0.0", server_port=args.port, share=args.share)
+    launch_studio_with_gradio_tunnel(port=args.port, share=args.share)
